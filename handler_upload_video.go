@@ -79,16 +79,30 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for quick start", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open file", err)
+		return
+	}
+	defer processedFile.Close()
+
+	if _, err := processedFile.Seek(0, io.SeekStart); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't reset seek on temp file", err)
 		return
 	}
-
+	
 	randBytes := make([]byte, 32)
 	rand.Read(randBytes)
 	randURLKey := base64.RawURLEncoding.EncodeToString(randBytes)
 
-	ratio, err := getVideoAspectRatio(tempFile.Name())
+	ratio, err := getVideoAspectRatio(processedFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio of video", err)
 		return
@@ -106,14 +120,14 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	if _, err := cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket: &cfg.s3Bucket,
 		Key: &randURLKey,
-		Body: tempFile,
+		Body: processedFile,
 		ContentType: &mediaType,
 	}); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't put temp file into bucket", err)
 		return
 	}
 
-	url := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, randURLKey)
+	url := fmt.Sprintf("%s,%s", cfg.s3Bucket, randURLKey)
 	dbVideo.VideoURL = &url
 
 	if err := cfg.db.UpdateVideo(dbVideo); err != nil {
@@ -121,5 +135,11 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, dbVideo)
+	signedVideo, err := cfg.dbVideoToSignedVideo(dbVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't sign db video", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideo)
 }
